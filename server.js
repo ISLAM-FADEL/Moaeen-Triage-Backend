@@ -3,45 +3,60 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --------- Minimal CORS (GitHub Pages -> Railway) ----------
+// =====================
+// ✅ FIX CORS (Preflight)
+// =====================
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+
+  // Reply to preflight requests
   if (req.method === "OPTIONS") return res.sendStatus(204);
+
   next();
 });
 
-// --------- Config ----------
+// =====================
+// Config
+// =====================
+const PORT = process.env.PORT || 3000;
+
+// Gemini key (Railway Variables)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
-  console.error("Missing GEMINI_API_KEY env var");
+  console.error("❌ Missing GEMINI_API_KEY env var");
   process.exit(1);
 }
 
-const PORT = process.env.PORT || 3000;
+// Optional limits
 const LIMIT_PER_DAY = Number(process.env.LIMIT_PER_DAY || 30);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000); // 6h
 
-// Gemini OpenAI-compatible endpoint base
-const GEMINI_BASE_URL =
-  process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3-flash-preview";
-
-// --------- Simple per-IP rate limit (per day) ----------
+// =====================
+// Simple per-IP rate limit (daily)
+// =====================
 const hits = new Map(); // ip -> {count, day}
+
 function todayKey() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
 }
+
 function getIP(req) {
   const xf = req.headers["x-forwarded-for"];
   if (typeof xf === "string" && xf.length) return xf.split(",")[0].trim();
   return req.socket.remoteAddress || "unknown";
 }
+
 function rateLimit(req, res, next) {
   const ip = getIP(req);
   const day = todayKey();
   const item = hits.get(ip);
+
   if (!item || item.day !== day) {
     hits.set(ip, { count: 1, day });
     return next();
@@ -53,223 +68,150 @@ function rateLimit(req, res, next) {
   return next();
 }
 
-// --------- Strict safety shortcut ----------
+// =====================
+// Cache (reduce cost)
+// =====================
+const cache = new Map(); // key -> {ts, data}
+
+function cacheKey(sessionId, message, lang) {
+  return `${String(lang)}::${String(sessionId)}::${String(message).trim().slice(0, 1500)}`;
+}
+
+function getCache(key) {
+  const c = cache.get(key);
+  if (!c) return null;
+  if (Date.now() - c.ts > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return c.data;
+}
+
+function setCache(key, data) {
+  cache.set(key, { ts: Date.now(), data });
+}
+
+// =====================
+// Safety shortcut (self-harm keywords)
+// =====================
 function detectCritical(text = "") {
-  const t = String(text).toLowerCase();
+  const t = text.toLowerCase();
   const bad = [
-    "انتحار","اموت","هقتل نفسي","اذي نفسي","مش عايز اعيش","عايز أموت",
-    "suicide","kill myself","self harm","end my life"
+    "انتحار", "هموت", "هقتل نفسي", "اذي نفسي", "مش عايز اعيش",
+    "suicide", "kill myself", "self harm"
   ];
   return bad.some(k => t.includes(k));
 }
 
-// --------- In-memory session memory (simple) ----------
-const sessions = new Map(); // sessionId -> {messages, ts}
-const MAX_TURNS = Number(process.env.MAX_TURNS || 16);
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 60 * 60 * 1000);
+// =====================
+// Gemini call helper (REST)
+// =====================
+async function callGemini({ message, lang = "ar" }) {
+  // model can be changed if you want
+  const model = "gemini-1.5-flash";
 
-function trimHistory(arr) {
-  const msgs = (Array.isArray(arr) ? arr : []).filter(
-    m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string"
-  );
-  return msgs.slice(-MAX_TURNS);
-}
+  const system_ar = `
+أنت "مُعِين" — مساعد داخل موقع دعم نفسي (تعليمي) وليس تشخيص طبي.
+أسلوبك: مصري بسيط، هادي، محترم. لمسة دينية خفيفة بدون وعظ.
+قواعد أمان: لا تشخيص نهائي، لا تطلب بيانات حساسة.
+لو في خطر (إيذاء نفس/انتحار): ادّي إرشاد طوارئ فورًا.
+المطلوب: رد مختصر + خطوات عملية + سؤال/سؤالين متابعة.
+واكتب عربي + إنجليزي لو المستخدم طلب الاثنين.
+`;
 
-function cleanOldSessions() {
-  const now = Date.now();
-  for (const [sid, s] of sessions.entries()) {
-    if (!s?.ts || (now - s.ts) > SESSION_TTL_MS) sessions.delete(sid);
-  }
-}
-setInterval(cleanOldSessions, 10 * 60 * 1000).unref?.();
+  const system_en = `
+You are "Moaeen" in a mental wellness website (educational, not medical diagnosis).
+Be calm, practical, safe. Do not request sensitive info.
+If self-harm risk appears: give urgent crisis guidance.
+Return a helpful short reply + practical steps + 1-2 follow-up questions.
+If user wants Arabic + English, include both.
+`;
 
-// --------- Gemini call (OpenAI-compatible Chat Completions) ----------
-async function geminiChatCompletions({ model, messages, temperature = 0.7, max_tokens = 900 }) {
-  const url = `${GEMINI_BASE_URL}/chat/completions`;
+  const system = lang === "ar" ? system_ar : system_en;
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: `${system}\n\nUser message:\n${message}` }]
+      }
+    ],
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 500
+    }
+  };
 
   const r = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      // Gemini OpenAI-compat REST uses Bearer API key per docs
-      "Authorization": `Bearer ${GEMINI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature,
-      max_tokens,
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
 
+  const data = await r.json();
   if (!r.ok) {
-    const detail = await r.text();
-    const err = new Error("Gemini error");
-    err.status = r.status;
-    err.detail = detail;
-    throw err;
+    const msg = data?.error?.message || "Gemini API error";
+    throw new Error(msg);
   }
 
-  const data = await r.json();
-  const reply = data?.choices?.[0]?.message?.content ?? "";
-  return { data, reply };
+  const text =
+    data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") ||
+    "No response";
+
+  return text;
 }
 
-app.get("/health", (req, res) => res.json({ ok: true, provider: "gemini", model: GEMINI_MODEL }));
+// =====================
+// Routes
+// =====================
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ------------------- /api/chat (ChatGPT-like) -------------------
-// body: { sessionId, message, lang: "ar"|"en", mode: "support"|"plan" }
+/**
+ * POST /api/chat
+ * body: { message: string, lang?: "ar"|"en", sessionId?: string }
+ */
 app.post("/api/chat", rateLimit, async (req, res) => {
   try {
-    const { sessionId, message, lang = "ar", mode = "support" } = req.body || {};
+    const { message, lang = "ar", sessionId = "default" } = req.body || {};
 
-    if (!sessionId || String(sessionId).trim().length < 6) {
-      return res.status(400).json({ error: "sessionId required" });
-    }
     if (!message || String(message).trim().length < 2) {
-      return res.status(400).json({ error: "message too short" });
+      return res.status(400).json({ error: "message is required" });
     }
 
-    const userText = String(message).trim();
-
-    if (detectCritical(userText)) {
-      const replyAr =
-        "أنا قلقان عليك بجد. لو في خطر فوري: اتصل بالطوارئ أو روح أقرب مستشفى دلوقتي، " +
-        "وكلم شخص موثوق حالًا ومتقعدش لوحدك. انت في أمان دلوقتي؟";
-      const replyEn =
-        "I’m really concerned about your safety. If you’re in immediate danger, contact emergency services or go to the nearest hospital now, " +
-        "and call someone you trust right away. Are you safe right now?";
-
-      const cur = sessions.get(sessionId) || { messages: [], ts: Date.now() };
-      cur.messages = trimHistory([
-        ...cur.messages,
-        { role: "user", content: userText },
-        { role: "assistant", content: (lang === "en" ? replyEn : replyAr) },
-      ]);
-      cur.ts = Date.now();
-      sessions.set(sessionId, cur);
-
-      return res.json({ reply: (lang === "en" ? replyEn : replyAr), safety_level: "high", mode });
-    }
-
-    const system_ar = `أنت "مُعِين" شات دعم نفسي ذكي (تعليمي، مش تشخيص).
-أسلوبك: مصري بسيط، هادي، محترم، داعم.
-ممنوع طلب بيانات حساسة. ممنوع وصف أدوية. لو الحالة خطرة وجّه لطوارئ.
-في آخر الرد اسأل سؤال متابعة واحد فقط.
-
-الوضع:
-- support: تعاطف + تهدئة + تنظيم الأفكار.
-- plan: خطوات عملية صغيرة + خطة اليوم/بكرة.`;
-
-    const system_en = `You are "Moaeen", a supportive mental wellness chat assistant (educational, not medical diagnosis).
-No sensitive data. No meds. If risk appears, provide crisis guidance.
-Ask ONE follow-up question at the end.
-Modes: support (empathy), plan (small actionable steps).`;
-
-    const modeHintAr = mode === "plan"
-      ? "ركز على خطوات عملية صغيرة وخطة واضحة."
-      : "ركز على الدعم والتهدئة.";
-
-    const modeHintEn = mode === "plan"
-      ? "Focus on a small actionable plan."
-      : "Focus on emotional support.";
-
-    const cur = sessions.get(sessionId) || { messages: [], ts: Date.now() };
-    const history = trimHistory(cur.messages);
-
-    const messages = [
-      { role: "system", content: (lang === "en" ? system_en : system_ar) },
-      ...history,
-      {
-        role: "user",
-        content: `${lang === "en" ? "Note:" : "ملاحظة:"} ${lang === "en" ? modeHintEn : modeHintAr}\n\n${userText}`,
-      },
-    ];
-
-    const { reply } = await geminiChatCompletions({
-      model: GEMINI_MODEL,
-      messages,
-      temperature: 0.75,
-      max_tokens: 900,
-    });
-
-    const newHistory = trimHistory([...history, { role: "user", content: userText }, { role: "assistant", content: reply }]);
-    sessions.set(sessionId, { messages: newHistory, ts: Date.now() });
-
-    return res.json({ reply, safety_level: "low", mode, provider: "gemini", model: GEMINI_MODEL });
-  } catch (e) {
-    return res.status(e.status || 500).json({ error: e.message, detail: e.detail });
-  }
-});
-
-// ------------------- /api/triage (structured JSON) -------------------
-app.post("/api/triage", rateLimit, async (req, res) => {
-  try {
-    const { text, lang = "ar" } = req.body || {};
-    if (!text || String(text).trim().length < 5) {
-      return res.status(400).json({ error: "Text too short" });
-    }
-
-    if (detectCritical(String(text))) {
+    // Safety fast path
+    if (detectCritical(String(message))) {
       return res.json({
+        ok: true,
         safety_level: "high",
-        domain: "unclear",
-        confidence: 0,
-        summary: lang === "ar" ? "الكلام فيه مؤشرات خطر واحتياج لدعم فوري." : "Risk indicators; urgent support needed.",
-        advice: [
-          lang === "ar"
-            ? "لو في خطر فوري: اطلب طوارئ/روح أقرب مستشفى، وكلم شخص موثوق حالًا."
-            : "If in immediate danger: contact local emergency services / go to the nearest hospital, and call someone you trust now."
-        ],
-        followups: [],
-        suggested_test: "FULL"
+        reply_ar:
+          "أنا حاسس إن الكلام فيه خطورة. لو في خطر فوري: كلم الإسعاف/الطوارئ فورًا أو روح أقرب مستشفى، وكلم شخص قريب منك حالًا. لو تقدر قولّي: هل أنت في أمان دلوقتي؟",
+        reply_en:
+          "This sounds serious. If you’re in immediate danger, contact local emergency services / go to the nearest hospital and call someone you trust now. Are you safe right now?"
       });
     }
 
-    const system_ar = `أخرج JSON فقط:
-{
- "safety_level":"low|medium|high",
- "domain":"depression|anxiety|ocd|trauma|unclear",
- "confidence":0-100,
- "summary":"جملة قصيرة",
- "advice":[5 نصائح قصيرة عملية واحدة منها لمسة إيمانية لطيفة],
- "followups":[3 أسئلة نعم/لا],
- "suggested_test":"PHQ-9|GAD-7|OCD|PTSD|FULL"
-}
-(تعليمي وليس تشخيصًا)`;
+    // Cache
+    const ck = cacheKey(sessionId, message, lang);
+    const cached = getCache(ck);
+    if (cached) {
+      return res.json({ ok: true, cached: true, ...cached });
+    }
 
-    const system_en = `Return ONLY JSON:
-{
- "safety_level":"low|medium|high",
- "domain":"depression|anxiety|ocd|trauma|unclear",
- "confidence":0-100,
- "summary":"short",
- "advice":[5 practical tips (one gentle faith-based optional line)],
- "followups":[3 yes/no questions],
- "suggested_test":"PHQ-9|GAD-7|OCD|PTSD|FULL"
-}
-(Educational, not diagnosis)`;
+    const reply = await callGemini({ message: String(message), lang: String(lang) });
 
-    const messages = [
-      { role: "system", content: (lang === "en" ? system_en : system_ar) },
-      { role: "user", content: String(text) },
-    ];
+    // If user wants both languages we can keep it simple:
+    // The prompt already says to return Arabic+English when needed.
+    const out = { reply };
 
-    const { reply } = await geminiChatCompletions({
-      model: GEMINI_MODEL,
-      messages,
-      temperature: 0.2,
-      max_tokens: 700,
-    });
-
-    let parsed;
-    try { parsed = JSON.parse(reply); }
-    catch { parsed = { error: "Bad JSON", raw: reply }; }
-
-    return res.json(parsed);
+    setCache(ck, out);
+    return res.json({ ok: true, cached: false, ...out });
   } catch (e) {
-    return res.status(e.status || 500).json({ error: e.message, detail: e.detail });
+    return res.status(500).json({ error: "Server error", detail: e.message });
   }
 });
 
-app.listen(PORT, () => console.log("Moaeen backend running on port", PORT));
+// =====================
+app.listen(PORT, () => console.log("✅ Moaeen backend running on port", PORT));
