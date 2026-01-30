@@ -11,17 +11,20 @@ const PORT = process.env.PORT || 3000;
 // ✅ Groq key
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// اختياري: لو عندك فرونت على دومين تاني
+// اختياري: دومين الفرونت (GitHub Pages)
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
-// Rate limit اختياري
-const LIMIT_PER_15_MIN = Number(process.env.LIMIT_PER_15_MIN || 60);
+// Rate limit
+const LIMIT_PER_15_MIN = Number(process.env.LIMIT_PER_15_MIN || 80);
 
 // Memory settings
 const MAX_TURNS = Number(process.env.MAX_TURNS || 8);
 
-// ✅ Groq model (ممكن تسيبه افتراضي)
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+// Model
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant"; 
+// بدائل قوية:
+// "llama-3.1-70b-versatile"
+// "mixtral-8x7b-32768" (لو متاح عندك)
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY missing in env vars");
@@ -38,9 +41,6 @@ app.use(
   })
 );
 
-// Serve frontend (لو عندك public)
-app.use(express.static("public"));
-
 // Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -50,7 +50,7 @@ const limiter = rateLimit({
 });
 app.use("/api/", limiter);
 
-// ====== In-memory conversation store ======
+// ====== In-memory sessions ======
 const sessions = new Map();
 
 function pushTurn(sessionId, role, text) {
@@ -66,13 +66,13 @@ function pushTurn(sessionId, role, text) {
 
 function getHistory(sessionId) {
   const arr = sessions.get(sessionId) || [];
+  // OpenAI-compatible roles: user | assistant
   return arr.map((m) => ({
-    role: m.role, // "user" | "assistant"
+    role: m.role === "model" ? "assistant" : "user",
     content: m.text,
   }));
 }
 
-// ====== Helpers ======
 function safeJsonParse(str) {
   try {
     return JSON.parse(str);
@@ -81,11 +81,11 @@ function safeJsonParse(str) {
   }
 }
 
-function buildSystemPrompt(mode = "triage") {
+function systemPrompt(mode = "triage") {
   const base = `
 You are "Moaeen", a bilingual Arabic/English assistant.
 Return ONLY valid JSON (no markdown, no extra text).
-The JSON schema:
+Schema:
 {
   "reply_ar": "Arabic reply in Egyptian tone, clear & respectful",
   "reply_en": "English reply, clear & professional",
@@ -99,57 +99,73 @@ The JSON schema:
     "urgent_actions_en": ["..."]
   }
 }
+
 Rules:
-- If medical emergency symptoms (chest pain, severe breathing difficulty, fainting, severe bleeding, stroke signs), set level="red" and give urgent actions.
-- If medical but not emergency, use yellow.
-- If safe/self-care, use green.
-- Keep replies helpful, structured, and ask 2-4 clarifying questions when needed.
-- Do NOT claim you are a doctor. Encourage professional care when needed.
+- If emergency symptoms (chest pain, severe breathing difficulty, fainting, severe bleeding, stroke signs) => level="red" + urgent actions.
+- If medical but not emergency => "yellow".
+- If safe/self-care => "green".
+- Ask 2-4 clarifying questions when needed.
+- Do NOT claim you are a doctor.
 `;
 
   if (mode === "general") {
-    return (
-      base +
-      `
-For general questions not medical, set triage.level="green" and keep triage reasons generic.`
-    );
+    return base + `For non-medical questions set triage.level="green".`;
   }
-
   return base;
 }
 
-async function groqChatCompletion({ model, messages }) {
-  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 700,
-      response_format: { type: "json_object" }, // ✅ يطلب JSON مضبوط
-    }),
-  });
+// ✅ Groq OpenAI-compatible request with retry
+async function groqChat({ messages, model }) {
+  const url = "https://api.groq.com/openai/v1/chat/completions";
 
-  const data = await resp.json().catch(() => null);
+  // Retry بسيط لو حصل ضغط/فشل مؤقت
+  const attempts = 3;
 
-  if (!resp.ok) {
-    const msg =
-      (data && (data.error?.message || data.message)) ||
-      `HTTP ${resp.status}`;
-    throw new Error(msg);
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.7,
+          max_tokens: 800,
+        }),
+      });
+
+      const data = await r.json().catch(() => null);
+
+      if (!r.ok) {
+        // لو Rate limit أو ضغط، جرّب تاني
+        const msg = data?.error?.message || `HTTP ${r.status}`;
+        if ((r.status === 429 || r.status >= 500) && i < attempts) {
+          await new Promise((res) => setTimeout(res, 700 * i));
+          continue;
+        }
+        throw new Error(msg);
+      }
+
+      const text = data?.choices?.[0]?.message?.content || "";
+      return text;
+    } catch (e) {
+      if (i === attempts) throw e;
+      await new Promise((res) => setTimeout(res, 700 * i));
+    }
   }
-
-  const text = data?.choices?.[0]?.message?.content || "";
-  return text;
 }
 
 // ====== Routes ======
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "Moaeen-Triage", time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: "Moaeen-Triage",
+    model: GROQ_MODEL,
+    time: new Date().toISOString(),
+  });
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -161,55 +177,71 @@ app.post("/api/chat", async (req, res) => {
 
   const sid = sessionId && typeof sessionId === "string" ? sessionId : uuidv4();
 
-  console.log("✅ /api/chat", { sid, len: message.length, mode: mode || "triage" });
-
   try {
-    // Add user message to memory
     pushTurn(sid, "user", message);
 
-    const system = buildSystemPrompt(mode || "triage");
+    const history = getHistory(sid);
 
+    // ✅ system + history + current user
     const messages = [
-      { role: "system", content: system },
-      ...getHistory(sid),
+      { role: "system", content: systemPrompt(mode || "triage") },
+      ...history,
       { role: "user", content: message },
     ];
 
-    const text = await groqChatCompletion({
-      model: GROQ_MODEL,
-      messages,
-    });
+    const raw = await groqChat({ messages, model: GROQ_MODEL });
 
-    // Save assistant reply
-    pushTurn(sid, "assistant", text);
+    pushTurn(sid, "model", raw);
 
-    const parsed = safeJsonParse(text);
+    const parsed = safeJsonParse(raw);
 
+    // لو الموديل ما التزمش بـ JSON: نخليه يرجع JSON مضمون
     if (!parsed) {
       return res.status(200).json({
         sessionId: sid,
-        reply_ar: "في مشكلة بسيطة في تنسيق الرد. جرّب تاني بنفس السؤال.",
-        reply_en: "There was a minor formatting issue. Please try again.",
-        raw: text,
+        reply_ar:
+          "في مشكلة بسيطة في تنسيق ردّ الذكاء الاصطناعي. جرّب تاني بنفس السؤال.",
+        reply_en:
+          "There was a minor formatting issue in the AI response. Please try again.",
+        triage: {
+          level: "green",
+          reason_ar: "مشكلة تقنية مؤقتة",
+          reason_en: "Temporary technical issue",
+          next_questions_ar: [],
+          next_questions_en: [],
+          urgent_actions_ar: [],
+          urgent_actions_en: [],
+        },
+        raw,
       });
     }
 
     return res.status(200).json({ sessionId: sid, ...parsed });
   } catch (err) {
     console.error("❌ /api/chat error:", err?.message || err);
-    return res.status(500).json({
-      error: "AI error",
-      detail: err?.message || String(err),
+
+    // ✅ هنا بدل ما يظهر Error خام للمستخدم: رسالة محترمة + تفاصيل للتشخيص
+    return res.status(200).json({
+      sessionId: sid,
+      reply_ar:
+        "حصلت مشكلة مؤقتة في الاتصال بالذكاء الاصطناعي. جرّب بعد دقيقة، ولو استمرت ابعتلي لقطة من (Railway Logs).",
+      reply_en:
+        "Temporary AI connection issue. Try again in a minute. If it persists, send me a screenshot from Railway Logs.",
+      triage: {
+        level: "green",
+        reason_ar: "اتصال/مزود AI مؤقت",
+        reason_en: "Temporary AI provider issue",
+        next_questions_ar: [],
+        next_questions_en: [],
+        urgent_actions_ar: [],
+        urgent_actions_en: [],
+      },
+      _error: String(err?.message || err),
+      _model: GROQ_MODEL,
     });
   }
 });
 
-// SPA fallback
-app.get("*", (req, res) => {
-  res.sendFile(process.cwd() + "/public/index.html");
-});
-
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🤖 Provider: Groq | Model: ${GROQ_MODEL}`);
 });
