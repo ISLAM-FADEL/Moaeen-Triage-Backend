@@ -3,9 +3,9 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --------- Minimal CORS (GitHub Pages / any frontend -> Railway) ----------
+// --------- Minimal CORS (GitHub Pages -> Railway) ----------
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // بعدين نضيّقها بالدومين بتاعك
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -13,16 +13,19 @@ app.use((req, res, next) => {
 });
 
 // --------- Config ----------
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY env var");
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+  console.error("Missing GEMINI_API_KEY env var");
   process.exit(1);
 }
 
 const PORT = process.env.PORT || 3000;
-const LIMIT_PER_DAY = Number(process.env.LIMIT_PER_DAY || 50);
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000); // 10 min
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const LIMIT_PER_DAY = Number(process.env.LIMIT_PER_DAY || 30);
+
+// Gemini OpenAI-compatible endpoint base
+const GEMINI_BASE_URL =
+  process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
 // --------- Simple per-IP rate limit (per day) ----------
 const hits = new Map(); // ip -> {count, day}
@@ -50,22 +53,7 @@ function rateLimit(req, res, next) {
   return next();
 }
 
-// --------- Very small cache to reduce cost ----------
-const cache = new Map(); // key -> {ts, data}
-function setCache(key, data) {
-  cache.set(key, { ts: Date.now(), data });
-}
-function getCache(key) {
-  const c = cache.get(key);
-  if (!c) return null;
-  if (Date.now() - c.ts > CACHE_TTL_MS) {
-    cache.delete(key);
-    return null;
-  }
-  return c.data;
-}
-
-// --------- Safety shortcut ----------
+// --------- Strict safety shortcut ----------
 function detectCritical(text = "") {
   const t = String(text).toLowerCase();
   const bad = [
@@ -75,160 +63,149 @@ function detectCritical(text = "") {
   return bad.some(k => t.includes(k));
 }
 
-// --------- In-memory "chat sessions" (simple memory) ----------
-// NOTE: Railway ممكن يعمل restart أحيانًا => الميموري بتتصفر.
-// ده طبيعي. بعدين نعمله DB لو حبيت.
-const sessions = new Map(); // sessionId -> {messages: [{role, content}], updatedAt}
-const MAX_TURNS = 16; // آخر كام رسالة نحتفظ بيهم
+// --------- In-memory session memory (simple) ----------
+const sessions = new Map(); // sessionId -> {messages, ts}
+const MAX_TURNS = Number(process.env.MAX_TURNS || 16);
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 60 * 60 * 1000);
 
-function normalizeLang(lang) {
-  const l = String(lang || "").toLowerCase();
-  if (l.startsWith("en")) return "en";
-  return "ar"; // default
+function trimHistory(arr) {
+  const msgs = (Array.isArray(arr) ? arr : []).filter(
+    m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string"
+  );
+  return msgs.slice(-MAX_TURNS);
 }
 
-function buildSystemPrompt(lang) {
-  if (lang === "en") {
-    return `You are "Moaeen" — a supportive AI assistant inside a mental wellness self-assessment app (not medical diagnosis).
-Style: calm, practical, friendly. Never claim to be a doctor. No sensitive data requests.
-If user shows self-harm/suicide intent: respond with urgent safety guidance and encourage contacting local emergency services and trusted people.
-Be bilingual if the user mixes languages.`;
+function cleanOldSessions() {
+  const now = Date.now();
+  for (const [sid, s] of sessions.entries()) {
+    if (!s?.ts || (now - s.ts) > SESSION_TTL_MS) sessions.delete(sid);
   }
-  return `أنت "مُعين" — مساعد ذكي داخل موقع دعم/تقييم ذاتي للصحة النفسية (مش تشخيص طبي).
-أسلوبك: مصري بسيط، هادي، عملي. من غير طلب بيانات حساسة.
-لو ظهرت نية إيذاء نفس/انتحار: ادي إرشاد طوارئ فورًا (يتواصل مع الطوارئ/أقرب مستشفى + شخص موثوق).
-لو المستخدم خلط عربي/إنجليزي رد عليه بنفس اللغة أو خلي الرد ثنائي.`;
+}
+setInterval(cleanOldSessions, 10 * 60 * 1000).unref?.();
+
+// --------- Gemini call (OpenAI-compatible Chat Completions) ----------
+async function geminiChatCompletions({ model, messages, temperature = 0.7, max_tokens = 900 }) {
+  const url = `${GEMINI_BASE_URL}/chat/completions`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // Gemini OpenAI-compat REST uses Bearer API key per docs
+      "Authorization": `Bearer ${GEMINI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature,
+      max_tokens,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text();
+    const err = new Error("Gemini error");
+    err.status = r.status;
+    err.detail = detail;
+    throw err;
+  }
+
+  const data = await r.json();
+  const reply = data?.choices?.[0]?.message?.content ?? "";
+  return { data, reply };
 }
 
-function getSession(sessionId) {
-  const id = String(sessionId || "").trim();
-  if (!id) return null;
-  return sessions.get(id) || null;
-}
+app.get("/health", (req, res) => res.json({ ok: true, provider: "gemini", model: GEMINI_MODEL }));
 
-function upsertSession(sessionId, messages) {
-  const id = String(sessionId || "").trim();
-  if (!id) return;
-  sessions.set(id, { messages, updatedAt: Date.now() });
-}
-
-// --------- Health ----------
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// --------- CHAT (Like ChatGPT) ----------
-// Request body:
-// {
-//   "sessionId": "abc123",         // optional but recommended
-//   "message": "hello",            // required (or send messages array)
-//   "messages": [{role:"user", content:"..."}], // optional (if you want to control history from frontend)
-//   "lang": "ar" | "en"            // optional
-// }
+// ------------------- /api/chat (ChatGPT-like) -------------------
+// body: { sessionId, message, lang: "ar"|"en", mode: "support"|"plan" }
 app.post("/api/chat", rateLimit, async (req, res) => {
   try {
-    const { sessionId, message, messages, lang } = req.body || {};
-    const L = normalizeLang(lang);
+    const { sessionId, message, lang = "ar", mode = "support" } = req.body || {};
 
-    // Safety immediate
-    const incomingText = message ?? (Array.isArray(messages) && messages.length ? messages[messages.length - 1]?.content : "");
-    if (detectCritical(incomingText)) {
-      const ar = {
-        ok: true,
-        safety_level: "high",
-        reply:
-          "أنا قلقان عليك. لو في خطر فوري أو نية لإيذاء نفسك: من فضلك اتصل بالطوارئ فورًا أو روح أقرب مستشفى، وكلم شخص قريب منك حالًا. لو تحب، قولّي: هل أنت لوحدك دلوقتي؟",
-      };
-      const en = {
-        ok: true,
-        safety_level: "high",
-        reply:
-          "I’m concerned about your safety. If you’re in immediate danger or thinking of harming yourself: please contact local emergency services now or go to the nearest hospital, and call someone you trust right away. Are you alone right now?",
-      };
-      return res.json(L === "en" ? en : ar);
+    if (!sessionId || String(sessionId).trim().length < 6) {
+      return res.status(400).json({ error: "sessionId required" });
+    }
+    if (!message || String(message).trim().length < 2) {
+      return res.status(400).json({ error: "message too short" });
     }
 
-    // Build history
-    let history = [];
+    const userText = String(message).trim();
 
-    // If frontend sends its own history, use it
-    if (Array.isArray(messages) && messages.length) {
-      history = messages
-        .filter(m => m && typeof m.role === "string" && typeof m.content === "string")
-        .map(m => ({ role: m.role, content: m.content }));
-    } else {
-      // Else use session memory
-      const s = getSession(sessionId);
-      if (s?.messages?.length) history = s.messages.slice();
-      if (typeof message === "string" && message.trim()) {
-        history.push({ role: "user", content: message.trim() });
-      }
+    if (detectCritical(userText)) {
+      const replyAr =
+        "أنا قلقان عليك بجد. لو في خطر فوري: اتصل بالطوارئ أو روح أقرب مستشفى دلوقتي، " +
+        "وكلم شخص موثوق حالًا ومتقعدش لوحدك. انت في أمان دلوقتي؟";
+      const replyEn =
+        "I’m really concerned about your safety. If you’re in immediate danger, contact emergency services or go to the nearest hospital now, " +
+        "and call someone you trust right away. Are you safe right now?";
+
+      const cur = sessions.get(sessionId) || { messages: [], ts: Date.now() };
+      cur.messages = trimHistory([
+        ...cur.messages,
+        { role: "user", content: userText },
+        { role: "assistant", content: (lang === "en" ? replyEn : replyAr) },
+      ]);
+      cur.ts = Date.now();
+      sessions.set(sessionId, cur);
+
+      return res.json({ reply: (lang === "en" ? replyEn : replyAr), safety_level: "high", mode });
     }
 
-    if (!history.length) {
-      return res.status(400).json({ error: "No message provided. Send {message} or {messages[]}." });
-    }
+    const system_ar = `أنت "مُعِين" شات دعم نفسي ذكي (تعليمي، مش تشخيص).
+أسلوبك: مصري بسيط، هادي، محترم، داعم.
+ممنوع طلب بيانات حساسة. ممنوع وصف أدوية. لو الحالة خطرة وجّه لطوارئ.
+في آخر الرد اسأل سؤال متابعة واحد فقط.
 
-    // Keep last turns
-    const trimmed = history.slice(-MAX_TURNS);
+الوضع:
+- support: تعاطف + تهدئة + تنظيم الأفكار.
+- plan: خطوات عملية صغيرة + خطة اليوم/بكرة.`;
 
-    // Cache (light)
-    const cacheKey = `${L}::${sessionId || "nosession"}::${trimmed.map(m => `${m.role}:${m.content}`).join("|").slice(0, 1500)}`;
-    const cached = getCache(cacheKey);
-    if (cached) {
-      return res.json({ ok: true, cached: true, ...cached });
-    }
+    const system_en = `You are "Moaeen", a supportive mental wellness chat assistant (educational, not medical diagnosis).
+No sensitive data. No meds. If risk appears, provide crisis guidance.
+Ask ONE follow-up question at the end.
+Modes: support (empathy), plan (small actionable steps).`;
 
-    const system = buildSystemPrompt(L);
+    const modeHintAr = mode === "plan"
+      ? "ركز على خطوات عملية صغيرة وخطة واضحة."
+      : "ركز على الدعم والتهدئة.";
 
-    // OpenAI Responses API payload
-    const payload = {
-      model: OPENAI_MODEL,
-      input: [
-        { role: "system", content: system },
-        ...trimmed
-      ],
-    };
+    const modeHintEn = mode === "plan"
+      ? "Focus on a small actionable plan."
+      : "Focus on emotional support.";
 
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+    const cur = sessions.get(sessionId) || { messages: [], ts: Date.now() };
+    const history = trimHistory(cur.messages);
+
+    const messages = [
+      { role: "system", content: (lang === "en" ? system_en : system_ar) },
+      ...history,
+      {
+        role: "user",
+        content: `${lang === "en" ? "Note:" : "ملاحظة:"} ${lang === "en" ? modeHintEn : modeHintAr}\n\n${userText}`,
       },
-      body: JSON.stringify(payload),
+    ];
+
+    const { reply } = await geminiChatCompletions({
+      model: GEMINI_MODEL,
+      messages,
+      temperature: 0.75,
+      max_tokens: 900,
     });
 
-    if (!r.ok) {
-      const detail = await r.text();
-      return res.status(500).json({ error: "OpenAI error", detail });
-    }
+    const newHistory = trimHistory([...history, { role: "user", content: userText }, { role: "assistant", content: reply }]);
+    sessions.set(sessionId, { messages: newHistory, ts: Date.now() });
 
-    const data = await r.json();
-    const reply = data.output_text || "";
-
-    // Update session memory (append assistant reply)
-    const newHistory = trimmed.concat([{ role: "assistant", content: reply }]);
-    if (sessionId) upsertSession(sessionId, newHistory.slice(-MAX_TURNS));
-
-    const response = {
-      ok: true,
-      sessionId: sessionId || null,
-      reply,
-      used_model: OPENAI_MODEL,
-    };
-
-    setCache(cacheKey, response);
-    return res.json(response);
+    return res.json({ reply, safety_level: "low", mode, provider: "gemini", model: GEMINI_MODEL });
   } catch (e) {
-    return res.status(500).json({ error: e?.message || "Server error" });
+    return res.status(e.status || 500).json({ error: e.message, detail: e.detail });
   }
 });
 
-// --------- Optional: keep your old triage endpoint (if you still use it) ----------
+// ------------------- /api/triage (structured JSON) -------------------
 app.post("/api/triage", rateLimit, async (req, res) => {
   try {
     const { text, lang = "ar" } = req.body || {};
-    const L = normalizeLang(lang);
-
     if (!text || String(text).trim().length < 5) {
       return res.status(400).json({ error: "Text too short" });
     }
@@ -238,21 +215,18 @@ app.post("/api/triage", rateLimit, async (req, res) => {
         safety_level: "high",
         domain: "unclear",
         confidence: 0,
-        summary: L === "ar" ? "الكلام فيه مؤشرات خطر واحتياج لدعم فوري." : "Risk indicators; urgent support needed.",
+        summary: lang === "ar" ? "الكلام فيه مؤشرات خطر واحتياج لدعم فوري." : "Risk indicators; urgent support needed.",
         advice: [
-          L === "ar"
+          lang === "ar"
             ? "لو في خطر فوري: اطلب طوارئ/روح أقرب مستشفى، وكلم شخص موثوق حالًا."
-            : "If in immediate danger: contact local emergency services / go to the nearest hospital, and call someone you trust now.",
+            : "If in immediate danger: contact local emergency services / go to the nearest hospital, and call someone you trust now."
         ],
         followups: [],
-        suggested_test: "FULL",
+        suggested_test: "FULL"
       });
     }
 
-    const system_ar = `أنت "مُعِين" — مساعد داخل تطبيق تقييم ذاتي للصحة النفسية (تعليمي)، وليس تشخيصًا طبيًا.
-أسلوبك: مصري بسيط، هادي، محترم. لمسة دينية خفيفة بدون وعظ أو فتاوى.
-STRICT SAFETY: لا تشخيص نهائي، لا طلب بيانات حساسة. إن ظهرت مخاطر (إيذاء نفس/انتحار) ارفع safety_level وأعطِ إرشاد طوارئ.
-أخرج JSON فقط وفق العقد:
+    const system_ar = `أخرج JSON فقط:
 {
  "safety_level":"low|medium|high",
  "domain":"depression|anxiety|ocd|trauma|unclear",
@@ -261,11 +235,10 @@ STRICT SAFETY: لا تشخيص نهائي، لا طلب بيانات حساسة.
  "advice":[5 نصائح قصيرة عملية واحدة منها لمسة إيمانية لطيفة],
  "followups":[3 أسئلة نعم/لا],
  "suggested_test":"PHQ-9|GAD-7|OCD|PTSD|FULL"
-}`;
+}
+(تعليمي وليس تشخيصًا)`;
 
-    const system_en = `You are "Moaeen" in a self-assessment mental wellness app (not medical diagnosis).
-Be calm, practical, and safe. No sensitive data. If risk appears, give crisis guidance.
-Return ONLY JSON:
+    const system_en = `Return ONLY JSON:
 {
  "safety_level":"low|medium|high",
  "domain":"depression|anxiety|ocd|trauma|unclear",
@@ -274,41 +247,28 @@ Return ONLY JSON:
  "advice":[5 practical tips (one gentle faith-based optional line)],
  "followups":[3 yes/no questions],
  "suggested_test":"PHQ-9|GAD-7|OCD|PTSD|FULL"
-}`;
+}
+(Educational, not diagnosis)`;
 
-    const payload = {
-      model: OPENAI_MODEL,
-      input: [
-        { role: "system", content: (L === "ar" ? system_ar : system_en) },
-        { role: "user", content: String(text) }
-      ],
-      text: { format: { type: "json_object" } }
-    };
+    const messages = [
+      { role: "system", content: (lang === "en" ? system_en : system_ar) },
+      { role: "user", content: String(text) },
+    ];
 
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
+    const { reply } = await geminiChatCompletions({
+      model: GEMINI_MODEL,
+      messages,
+      temperature: 0.2,
+      max_tokens: 700,
     });
 
-    if (!r.ok) {
-      const detail = await r.text();
-      return res.status(500).json({ error: "OpenAI error", detail });
-    }
-
-    const data = await r.json();
-    const out = data.output_text || "{}";
-
     let parsed;
-    try { parsed = JSON.parse(out); }
-    catch { parsed = { error: "Bad JSON", raw: out }; }
+    try { parsed = JSON.parse(reply); }
+    catch { parsed = { error: "Bad JSON", raw: reply }; }
 
     return res.json(parsed);
   } catch (e) {
-    return res.status(500).json({ error: e?.message || "Server error" });
+    return res.status(e.status || 500).json({ error: e.message, detail: e.detail });
   }
 });
 
