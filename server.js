@@ -1,40 +1,35 @@
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { v4 as uuidv4 } from "uuid";
 
 const app = express();
 
-// =====================
-// Config
-// =====================
+// ====== Config ======
 const PORT = process.env.PORT || 3000;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// ✅ Groq key
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// حط دومين الفرونت هنا (GitHub Pages) أو سيبه "*" أثناء التجربة
-// مثال: https://islam-fadel.github.io
+// اختياري: لو عندك فرونت على دومين تاني
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
-// Rate limit
+// Rate limit اختياري
 const LIMIT_PER_15_MIN = Number(process.env.LIMIT_PER_15_MIN || 60);
 
-// Memory
+// Memory settings
 const MAX_TURNS = Number(process.env.MAX_TURNS || 8);
 
-if (!GEMINI_API_KEY) {
-  console.error("❌ GEMINI_API_KEY missing in env vars");
+// ✅ Groq model (ممكن تسيبه افتراضي)
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+
+if (!GROQ_API_KEY) {
+  console.error("❌ GROQ_API_KEY missing in env vars");
   process.exit(1);
 }
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-
-// =====================
-// Middleware
-// =====================
+// ====== Middleware ======
 app.use(express.json({ limit: "1mb" }));
-
 app.use(
   cors({
     origin: FRONTEND_ORIGIN === "*" ? true : FRONTEND_ORIGIN,
@@ -43,22 +38,19 @@ app.use(
   })
 );
 
-// لو عندك فولدر public في نفس repo بتاع الباك اند
+// Serve frontend (لو عندك public)
 app.use(express.static("public"));
 
-// rate limiter (متوافق مع نسخ مختلفة)
+// Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: LIMIT_PER_15_MIN,
   limit: LIMIT_PER_15_MIN,
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use("/api/", limiter);
 
-// =====================
-// In-memory sessions
-// =====================
+// ====== In-memory conversation store ======
 const sessions = new Map();
 
 function pushTurn(sessionId, role, text) {
@@ -75,11 +67,12 @@ function pushTurn(sessionId, role, text) {
 function getHistory(sessionId) {
   const arr = sessions.get(sessionId) || [];
   return arr.map((m) => ({
-    role: m.role,
-    parts: [{ text: m.text }],
+    role: m.role, // "user" | "assistant"
+    content: m.text,
   }));
 }
 
+// ====== Helpers ======
 function safeJsonParse(str) {
   try {
     return JSON.parse(str);
@@ -115,103 +108,48 @@ Rules:
 `;
 
   if (mode === "general") {
-    return base + `
-For general questions not medical, set triage.level="green" and keep triage reasons generic.`;
+    return (
+      base +
+      `
+For general questions not medical, set triage.level="green" and keep triage reasons generic.`
+    );
   }
+
   return base;
 }
 
-// =====================
-// Gemini model fallback (حل مشكلة 404 Not Found)
-// =====================
-function getCandidateModels() {
-  const envModel = (process.env.GEMINI_MODEL || "").trim();
+async function groqChatCompletion({ model, messages }) {
+  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: 700,
+      response_format: { type: "json_object" }, // ✅ يطلب JSON مضبوط
+    }),
+  });
 
-  // جرّب موديلات شائعة — ولو واحد مش متاح هيعمل fallback للي بعده
-  const candidates = [
-    envModel,
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-  ].filter(Boolean);
+  const data = await resp.json().catch(() => null);
 
-  // إزالة تكرارات
-  return [...new Set(candidates)];
-}
-
-async function generateJsonReply({ sid, message, mode }) {
-  const candidates = getCandidateModels();
-  let lastErr = null;
-
-  // history قبل ما نضيف رسالة المستخدم الحالية
-  const history = getHistory(sid);
-
-  for (const modelName of candidates) {
-    try {
-      const modelObj = genAI.getGenerativeModel({
-        model: modelName,
-        systemInstruction: buildSystemPrompt(mode || "triage"),
-      });
-
-      const chat = modelObj.startChat({
-        history,
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 700,
-        },
-      });
-
-      const result = await chat.sendMessage(message);
-      const text = result.response.text();
-
-      // لازم JSON
-      const parsed = safeJsonParse(text);
-      if (parsed) return { ok: true, modelName, parsed, raw: text };
-
-      // لو مش JSON: نحاول نصلّح مرة واحدة بطلب إعادة JSON فقط
-      const fixPrompt =
-        "Return ONLY valid JSON following the exact schema. No extra text.";
-      const fix = await chat.sendMessage(fixPrompt);
-      const fixedText = fix.response.text();
-      const fixedParsed = safeJsonParse(fixedText);
-      if (fixedParsed) return { ok: true, modelName, parsed: fixedParsed, raw: fixedText };
-
-      // فشل parsing
-      return { ok: false, modelName, error: "non_json", raw: text };
-    } catch (e) {
-      lastErr = e;
-
-      const msg = String(e?.message || e);
-      // لو Not Found/404 أو model not found نكمل fallback
-      const isNotFound =
-        msg.includes("404") ||
-        msg.toLowerCase().includes("not found") ||
-        msg.toLowerCase().includes("models/") ||
-        msg.toLowerCase().includes("is not found");
-
-      console.error(`❌ Model failed: ${modelName} ->`, msg);
-
-      if (isNotFound) continue;
-      // أي خطأ تاني نوقف ونرجع
-      break;
-    }
+  if (!resp.ok) {
+    const msg =
+      (data && (data.error?.message || data.message)) ||
+      `HTTP ${resp.status}`;
+    throw new Error(msg);
   }
 
-  return { ok: false, error: "all_models_failed", detail: String(lastErr?.message || lastErr) };
+  const text = data?.choices?.[0]?.message?.content || "";
+  return text;
 }
 
-// =====================
-// Routes
-// =====================
+// ====== Routes ======
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Moaeen-Triage",
-    time: new Date().toISOString(),
-  });
+  res.json({ ok: true, service: "Moaeen-Triage", time: new Date().toISOString() });
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -223,50 +161,55 @@ app.post("/api/chat", async (req, res) => {
 
   const sid = sessionId && typeof sessionId === "string" ? sessionId : uuidv4();
 
+  console.log("✅ /api/chat", { sid, len: message.length, mode: mode || "triage" });
+
   try {
-    console.log("✅ /api/chat", { sid, len: message.length, mode: mode || "triage" });
-
-    const out = await generateJsonReply({ sid, message, mode });
-
-    // خزن الرسائل (بعد ما ننجح/نفشل)
+    // Add user message to memory
     pushTurn(sid, "user", message);
 
-    if (out.ok && out.parsed) {
-      pushTurn(sid, "model", JSON.stringify(out.parsed));
-      return res.status(200).json({ sessionId: sid, ...out.parsed, _model: out.modelName });
+    const system = buildSystemPrompt(mode || "triage");
+
+    const messages = [
+      { role: "system", content: system },
+      ...getHistory(sid),
+      { role: "user", content: message },
+    ];
+
+    const text = await groqChatCompletion({
+      model: GROQ_MODEL,
+      messages,
+    });
+
+    // Save assistant reply
+    pushTurn(sid, "assistant", text);
+
+    const parsed = safeJsonParse(text);
+
+    if (!parsed) {
+      return res.status(200).json({
+        sessionId: sid,
+        reply_ar: "في مشكلة بسيطة في تنسيق الرد. جرّب تاني بنفس السؤال.",
+        reply_en: "There was a minor formatting issue. Please try again.",
+        raw: text,
+      });
     }
 
-    // لو رجع non_json أو فشل كله: رجّع رد آمن للمستخدم (من غير تفاصيل URL/Stack)
-    return res.status(200).json({
-      sessionId: sid,
-      reply_ar: "حصلت مشكلة مؤقتة في رد الذكاء الاصطناعي. جرّب تاني بعد دقيقة.",
-      reply_en: "Temporary AI issue. Please try again in a minute.",
-      triage: {
-        level: "green",
-        reason_ar: "مشكلة تقنية مؤقتة",
-        reason_en: "Temporary technical issue",
-        next_questions_ar: [],
-        next_questions_en: [],
-        urgent_actions_ar: [],
-        urgent_actions_en: [],
-      },
-      _error: out.error || "unknown",
-      _model: out.modelName || null,
-    });
+    return res.status(200).json({ sessionId: sid, ...parsed });
   } catch (err) {
-    console.error("❌ /api/chat fatal:", err?.message || err);
+    console.error("❌ /api/chat error:", err?.message || err);
     return res.status(500).json({
-      error: "server_error",
-      detail: "Unexpected server error",
+      error: "AI error",
+      detail: err?.message || String(err),
     });
   }
 });
 
-// SPA fallback (لو عندك public/index.html)
+// SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(process.cwd() + "/public/index.html");
 });
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🤖 Provider: Groq | Model: ${GROQ_MODEL}`);
 });
