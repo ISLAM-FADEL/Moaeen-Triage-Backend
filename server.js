@@ -1,159 +1,198 @@
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-
-/**
- * Moaeen Triage Backend - Gemini version
- * - Node 18+ (fetch built-in)
- * - Railway compatible (uses process.env.PORT)
- */
+import { v4 as uuidv4 } from "uuid";
 
 const app = express();
 
-// ====== Middlewares ======
+// ====== Config ======
+const PORT = process.env.PORT || 3000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+// اختياري: لو عندك فرونت على دومين تاني، حط FRONTEND_ORIGIN
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
+
+// Rate limit اختياري
+const LIMIT_PER_15_MIN = Number(process.env.LIMIT_PER_15_MIN || 60);
+
+// Memory settings
+const MAX_TURNS = Number(process.env.MAX_TURNS || 8); // آخر كام رسالة تتخزن لكل session
+
+if (!GEMINI_API_KEY) {
+  console.error("❌ GEMINI_API_KEY missing in env vars");
+  process.exit(1);
+}
+
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+// ====== Middleware ======
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
-    origin: "*",
+    origin: FRONTEND_ORIGIN === "*" ? true : FRONTEND_ORIGIN,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// Handle preflight explicitly (safe)
-app.options("*", (_, res) => res.sendStatus(204));
+// Serve frontend
+app.use(express.static("public"));
 
-// ====== ENV ======
-const PORT = process.env.PORT || 3000;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Rate limiter (يحمي السيرفر من السبام)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  limit: LIMIT_PER_15_MIN,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/api/", limiter);
 
-// IMPORTANT: do not crash immediately if missing key in Railway build phase,
-// but we will block /api/chat with a clear error.
-if (!GEMINI_API_KEY) {
-  console.warn("⚠️ GEMINI_API_KEY is missing (Railway Variables). /api/chat will not work.");
+// ====== In-memory conversation store ======
+/**
+ * sessions = {
+ *   [sessionId]: [{role: "user"|"model", text: "..."}, ...]
+ * }
+ */
+const sessions = new Map();
+
+function pushTurn(sessionId, role, text) {
+  if (!sessions.has(sessionId)) sessions.set(sessionId, []);
+  const arr = sessions.get(sessionId);
+  arr.push({ role, text, at: Date.now() });
+
+  // keep only last N*2 messages تقريباً
+  const maxMessages = MAX_TURNS * 2;
+  if (arr.length > maxMessages) {
+    sessions.set(sessionId, arr.slice(arr.length - maxMessages));
+  }
 }
 
-// ====== Gemini Client ======
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+function getHistory(sessionId) {
+  const arr = sessions.get(sessionId) || [];
+  // Gemini history format:
+  // [{ role: "user", parts: [{text:"..."}] }, { role:"model", parts:[{text:"..."}]}]
+  return arr.map((m) => ({
+    role: m.role,
+    parts: [{ text: m.text }],
+  }));
+}
 
-// ====== Simple Rate Limit (in-memory) ======
-// You can control daily limits from Railway variables if you like.
-const LIMIT_PER_MIN = Number(process.env.LIMIT_PER_MIN || 30);
-const ipBuckets = new Map();
+// ====== Helpers ======
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
 
-/**
- * Basic per-IP per-minute limiter
- */
-function rateLimit(req, res, next) {
-  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
-  const now = Date.now();
-  const windowMs = 60_000;
+function buildSystemPrompt(mode = "triage") {
+  // mode: triage | general
+  const base = `
+You are "Moaeen", a bilingual Arabic/English assistant.
+Return ONLY valid JSON (no markdown, no extra text).
+The JSON schema:
+{
+  "reply_ar": "Arabic reply in Egyptian tone, clear & respectful",
+  "reply_en": "English reply, clear & professional",
+  "triage": {
+    "level": "green|yellow|red",
+    "reason_ar": "سبب مختصر بالعربي",
+    "reason_en": "Short reason in English",
+    "next_questions_ar": ["..."],
+    "next_questions_en": ["..."],
+    "urgent_actions_ar": ["..."],
+    "urgent_actions_en": ["..."]
+  }
+}
+Rules:
+- If medical emergency symptoms (chest pain, severe breathing difficulty, fainting, severe bleeding, stroke signs), set level="red" and give urgent actions.
+- If medical but not emergency, use yellow.
+- If safe/self-care, use green.
+- Keep replies helpful, structured, and ask 2-4 clarifying questions when needed.
+- Do NOT claim you are a doctor. Encourage professional care when needed.
+`;
 
-  const bucket = ipBuckets.get(ip) || { count: 0, start: now };
-
-  // reset window
-  if (now - bucket.start > windowMs) {
-    bucket.count = 0;
-    bucket.start = now;
+  if (mode === "general") {
+    return (
+      base +
+      `
+For general questions not medical, set triage.level="green" and keep triage reasons generic.`
+    );
   }
 
-  bucket.count += 1;
-  ipBuckets.set(ip, bucket);
-
-  if (bucket.count > LIMIT_PER_MIN) {
-    return res.status(429).json({
-      ok: false,
-      error: "Too many requests. Please slow down.",
-      details: { limitPerMinute: LIMIT_PER_MIN },
-    });
-  }
-
-  next();
+  return base;
 }
 
 // ====== Routes ======
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "moaeen-triage-backend",
-    provider: "gemini",
-    hasKey: Boolean(GEMINI_API_KEY),
-    time: new Date().toISOString(),
-  });
+  res.json({ ok: true, service: "Moaeen-Triage", time: new Date().toISOString() });
 });
 
-/**
- * POST /api/chat
- * body: { message: string, lang?: "ar"|"en", history?: [{role:"user"|"assistant", content:string}] }
- */
-app.post("/api/chat", rateLimit, async (req, res) => {
+app.post("/api/chat", async (req, res) => {
+  const { message, sessionId, mode } = req.body || {};
+
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  const sid = sessionId && typeof sessionId === "string" ? sessionId : uuidv4();
+
+  // Log request
+  console.log("✅ /api/chat", { sid, len: message.length, mode: mode || "triage" });
+
   try {
-    if (!GEMINI_API_KEY || !genAI) {
-      return res.status(500).json({
-        ok: false,
-        error: "GEMINI_API_KEY missing",
-        details: "Set GEMINI_API_KEY in Railway -> Project -> Variables",
+    const modelName = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+    const modelObj = genAI.getGenerativeModel({
+      model: modelName,
+      systemInstruction: buildSystemPrompt(mode || "triage"),
+    });
+
+    // Add user message to memory
+    pushTurn(sid, "user", message);
+
+    const chat = modelObj.startChat({
+      history: getHistory(sid),
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 700,
+      },
+    });
+
+    const result = await chat.sendMessage(message);
+    const text = result.response.text();
+
+    // Add model response to memory
+    pushTurn(sid, "model", text);
+
+    const parsed = safeJsonParse(text);
+
+    // لو Gemini رجع نص مش JSON مضبوط
+    if (!parsed) {
+      return res.status(200).json({
+        sessionId: sid,
+        reply_ar: "في مشكلة بسيطة في تنسيق الرد. جرّب تاني بنفس السؤال.",
+        reply_en: "There was a minor formatting issue. Please try again.",
+        raw: text,
       });
     }
 
-    const { message, lang = "ar", history = [] } = req.body || {};
-
-    if (!message || typeof message !== "string" || !message.trim()) {
-      return res.status(400).json({ ok: false, error: "message is required" });
-    }
-
-    // Choose a stable model. You can change it later if you want.
-    // "gemini-1.5-flash" is fast and cheap; "gemini-1.5-pro" is stronger.
-    const modelName = process.env.GEMINI_MODEL || "gemini-1.5-flash";
-    const model = genAI.getGenerativeModel({ model: modelName });
-
-    // System prompt (bilingual behavior)
-    const systemPrompt =
-      lang === "en"
-        ? `You are Moaeen assistant. Be helpful, clear, and safe. Ask brief follow-up questions only when necessary.`
-        : `أنت مساعد "مُعين". رد بإجابات واضحة وبسيطة وبلهجة مصرية لطيفة. لو محتاج توضيح اسأل سؤال واحد بس.`;
-
-    // Build conversation text (simple + reliable)
-    const historyText = Array.isArray(history)
-      ? history
-          .slice(-12)
-          .map((h) => {
-            const r = h?.role === "assistant" ? "Assistant" : "User";
-            const c = typeof h?.content === "string" ? h.content : "";
-            return `${r}: ${c}`;
-          })
-          .join("\n")
-      : "";
-
-    const prompt = `
-SYSTEM: ${systemPrompt}
-
-${historyText ? `CHAT HISTORY:\n${historyText}\n` : ""}
-
-User: ${message}
-Assistant:
-`.trim();
-
-    const result = await model.generateContent(prompt);
-    const reply = result?.response?.text?.() || "";
-
-    return res.json({
-      ok: true,
-      provider: "gemini",
-      model: modelName,
-      reply,
-    });
+    return res.status(200).json({ sessionId: sid, ...parsed });
   } catch (err) {
-    console.error("❌ /api/chat error:", err);
+    console.error("❌ /api/chat error:", err?.message || err);
     return res.status(500).json({
-      ok: false,
-      error: "Gemini error",
-      details: err?.message || String(err),
+      error: "AI error",
+      detail: err?.message || String(err),
     });
   }
 });
 
-// ====== Start server ======
+// SPA fallback (لو فتحت أي مسار يرجّع index.html)
+app.get("*", (req, res) => {
+  res.sendFile(process.cwd() + "/public/index.html");
+});
+
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
