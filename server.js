@@ -3,25 +3,28 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --------- CORS ----------
+// --------- Minimal CORS (GitHub Pages / any frontend -> Railway) ----------
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", "*"); // بعدين نضيّقها بالدومين بتاعك
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// --------- ENV ----------
+// --------- Config ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY env var");
   process.exit(1);
 }
-const PORT = process.env.PORT || 3000;
 
-// --------- Rate limit (per IP / day) ----------
-const LIMIT_PER_DAY = Number(process.env.LIMIT_PER_DAY || 30);
+const PORT = process.env.PORT || 3000;
+const LIMIT_PER_DAY = Number(process.env.LIMIT_PER_DAY || 50);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000); // 10 min
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+// --------- Simple per-IP rate limit (per day) ----------
 const hits = new Map(); // ip -> {count, day}
 function todayKey() {
   const d = new Date();
@@ -47,124 +50,151 @@ function rateLimit(req, res, next) {
   return next();
 }
 
-// --------- Cache (triage) ----------
+// --------- Very small cache to reduce cost ----------
 const cache = new Map(); // key -> {ts, data}
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 2 * 60 * 60 * 1000);
-function cacheKey(text, lang) {
-  return `${lang}::${text.trim().slice(0, 2000)}`;
+function setCache(key, data) {
+  cache.set(key, { ts: Date.now(), data });
 }
-
-// --------- Session memory (chat) ----------
-const sessions = new Map(); // session_id -> {messages: [], ts}
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 60 * 60 * 1000);
-const MAX_TURNS = Number(process.env.MAX_TURNS || 12); // keep last 24 msgs
-
-function cleanOldSessions() {
-  const t = Date.now();
-  for (const [sid, obj] of sessions.entries()) {
-    if (!obj?.ts || (t - obj.ts) > SESSION_TTL_MS) sessions.delete(sid);
+function getCache(key) {
+  const c = cache.get(key);
+  if (!c) return null;
+  if (Date.now() - c.ts > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
   }
-}
-setInterval(cleanOldSessions, 10 * 60 * 1000).unref?.();
-
-function trimHistory(arr) {
-  if (!Array.isArray(arr)) return [];
-  const msgs = arr.filter(m => m && (m.role === "user" || m.role === "assistant"));
-  return msgs.slice(-2 * MAX_TURNS);
+  return c.data;
 }
 
-// --------- Safety detection ----------
+// --------- Safety shortcut ----------
 function detectCritical(text = "") {
   const t = String(text).toLowerCase();
   const bad = [
-    "انتحار","هموت","عايز اموت","هقتل نفسي","اذي نفسي","مش عايز اعيش","بفكر انهي حياتي",
+    "انتحار","اموت","هقتل نفسي","اذي نفسي","مش عايز اعيش","عايز أموت",
     "suicide","kill myself","self harm","end my life"
   ];
   return bad.some(k => t.includes(k));
 }
 
+// --------- In-memory "chat sessions" (simple memory) ----------
+// NOTE: Railway ممكن يعمل restart أحيانًا => الميموري بتتصفر.
+// ده طبيعي. بعدين نعمله DB لو حبيت.
+const sessions = new Map(); // sessionId -> {messages: [{role, content}], updatedAt}
+const MAX_TURNS = 16; // آخر كام رسالة نحتفظ بيهم
+
+function normalizeLang(lang) {
+  const l = String(lang || "").toLowerCase();
+  if (l.startsWith("en")) return "en";
+  return "ar"; // default
+}
+
+function buildSystemPrompt(lang) {
+  if (lang === "en") {
+    return `You are "Moaeen" — a supportive AI assistant inside a mental wellness self-assessment app (not medical diagnosis).
+Style: calm, practical, friendly. Never claim to be a doctor. No sensitive data requests.
+If user shows self-harm/suicide intent: respond with urgent safety guidance and encourage contacting local emergency services and trusted people.
+Be bilingual if the user mixes languages.`;
+  }
+  return `أنت "مُعين" — مساعد ذكي داخل موقع دعم/تقييم ذاتي للصحة النفسية (مش تشخيص طبي).
+أسلوبك: مصري بسيط، هادي، عملي. من غير طلب بيانات حساسة.
+لو ظهرت نية إيذاء نفس/انتحار: ادي إرشاد طوارئ فورًا (يتواصل مع الطوارئ/أقرب مستشفى + شخص موثوق).
+لو المستخدم خلط عربي/إنجليزي رد عليه بنفس اللغة أو خلي الرد ثنائي.`;
+}
+
+function getSession(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) return null;
+  return sessions.get(id) || null;
+}
+
+function upsertSession(sessionId, messages) {
+  const id = String(sessionId || "").trim();
+  if (!id) return;
+  sessions.set(id, { messages, updatedAt: Date.now() });
+}
+
+// --------- Health ----------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ======================================================
-//  /api/chat  (ChatGPT-like: multi-turn + memory session)
-//  Request:
-//   { session_id, message, mode: "support"|"plan", lang:"ar" }
-//  Response:
-//   { reply, safety_level, mode }
-// ======================================================
+// --------- CHAT (Like ChatGPT) ----------
+// Request body:
+// {
+//   "sessionId": "abc123",         // optional but recommended
+//   "message": "hello",            // required (or send messages array)
+//   "messages": [{role:"user", content:"..."}], // optional (if you want to control history from frontend)
+//   "lang": "ar" | "en"            // optional
+// }
 app.post("/api/chat", rateLimit, async (req, res) => {
   try {
-    const { session_id, message, mode = "support", lang = "ar" } = req.body || {};
+    const { sessionId, message, messages, lang } = req.body || {};
+    const L = normalizeLang(lang);
 
-    if (!session_id || String(session_id).trim().length < 6) {
-      return res.status(400).json({ error: "session_id required" });
-    }
-    if (!message || String(message).trim().length < 2) {
-      return res.status(400).json({ error: "message too short" });
-    }
-
-    const userText = String(message).trim();
-
-    // Safety shortcut
-    if (detectCritical(userText)) {
-      const replyAr =
-        "أنا قلقان عليك بجد. لو في خطر فوري: اتصل بالطوارئ أو روح أقرب مستشفى دلوقتي. " +
-        "وكلم شخص قريب منك حالًا ومتقعدش لوحدك. انت في أمان دلوقتي؟";
-      const replyEn =
-        "I'm really concerned about your safety. If you're in immediate danger, contact emergency services or go to the nearest hospital now. " +
-        "Please call someone you trust and don’t stay alone. Are you safe right now?";
-
-      const cur = sessions.get(session_id) || { messages: [], ts: Date.now() };
-      cur.messages = trimHistory([...cur.messages, { role: "user", content: userText }, { role: "assistant", content: lang === "ar" ? replyAr : replyEn }]);
-      cur.ts = Date.now();
-      sessions.set(session_id, cur);
-
-      return res.json({ reply: lang === "ar" ? replyAr : replyEn, safety_level: "high", mode });
+    // Safety immediate
+    const incomingText = message ?? (Array.isArray(messages) && messages.length ? messages[messages.length - 1]?.content : "");
+    if (detectCritical(incomingText)) {
+      const ar = {
+        ok: true,
+        safety_level: "high",
+        reply:
+          "أنا قلقان عليك. لو في خطر فوري أو نية لإيذاء نفسك: من فضلك اتصل بالطوارئ فورًا أو روح أقرب مستشفى، وكلم شخص قريب منك حالًا. لو تحب، قولّي: هل أنت لوحدك دلوقتي؟",
+      };
+      const en = {
+        ok: true,
+        safety_level: "high",
+        reply:
+          "I’m concerned about your safety. If you’re in immediate danger or thinking of harming yourself: please contact local emergency services now or go to the nearest hospital, and call someone you trust right away. Are you alone right now?",
+      };
+      return res.json(L === "en" ? en : ar);
     }
 
-    // Load memory
-    const cur = sessions.get(session_id) || { messages: [], ts: Date.now() };
-    const history = trimHistory(cur.messages);
+    // Build history
+    let history = [];
 
-    const system_ar = `أنت "مُعِين" شات دعم نفسي ذكي (تعليمي، مش تشخيص).
-أسلوبك: مصري بسيط، هادي، محترم، داعم.
-ممنوع طلب بيانات حساسة. ممنوع وصف أدوية أو تشخيص نهائي.
-STRICT SAFETY: لو ظهر خطر إيذاء نفس/انتحار قدم إرشاد طوارئ.
-اكتب ردود مفيدة وواضحة. وفي آخر الرد اسأل سؤال متابعة واحد فقط.
+    // If frontend sends its own history, use it
+    if (Array.isArray(messages) && messages.length) {
+      history = messages
+        .filter(m => m && typeof m.role === "string" && typeof m.content === "string")
+        .map(m => ({ role: m.role, content: m.content }));
+    } else {
+      // Else use session memory
+      const s = getSession(sessionId);
+      if (s?.messages?.length) history = s.messages.slice();
+      if (typeof message === "string" && message.trim()) {
+        history.push({ role: "user", content: message.trim() });
+      }
+    }
 
-الوضع (mode):
-- support: تعاطف + تهدئة + تنظيم الكلام.
-- plan: خطوات عملية صغيرة + خطة اليوم/بكرة.`;
+    if (!history.length) {
+      return res.status(400).json({ error: "No message provided. Send {message} or {messages[]}." });
+    }
 
-    const system_en = `You are "Moaeen", a supportive mental wellness chat assistant (educational, not medical diagnosis).
-Calm, empathetic. No sensitive data. No meds. If risk appears, provide crisis guidance.
-Ask ONE follow-up question at the end.
-Modes: support (empathy), plan (practical steps + plan).`;
+    // Keep last turns
+    const trimmed = history.slice(-MAX_TURNS);
 
-    const modeHintAr = mode === "plan"
-      ? "ركز على خطوات عملية صغيرة وخطة واضحة."
-      : "ركز على الدعم والتهدئة.";
+    // Cache (light)
+    const cacheKey = `${L}::${sessionId || "nosession"}::${trimmed.map(m => `${m.role}:${m.content}`).join("|").slice(0, 1500)}`;
+    const cached = getCache(cacheKey);
+    if (cached) {
+      return res.json({ ok: true, cached: true, ...cached });
+    }
 
-    const modeHintEn = mode === "plan"
-      ? "Focus on a small actionable plan."
-      : "Focus on emotional support.";
+    const system = buildSystemPrompt(L);
 
+    // OpenAI Responses API payload
     const payload = {
-      model: "gpt-5.2",
+      model: OPENAI_MODEL,
       input: [
-        { role: "system", content: (lang === "ar" ? system_ar : system_en) },
-        ...history,
-        { role: "user", content: `${lang === "ar" ? "ملاحظة:" : "Note:"} ${lang === "ar" ? modeHintAr : modeHintEn}\n\n${userText}` }
-      ]
+        { role: "system", content: system },
+        ...trimmed
+      ],
     };
 
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
     if (!r.ok) {
@@ -173,24 +203,32 @@ Modes: support (empathy), plan (practical steps + plan).`;
     }
 
     const data = await r.json();
-    const reply = data.output_text || (lang === "ar" ? "معلش، ممكن تعيد صياغة كلامك؟" : "Sorry—can you rephrase?");
+    const reply = data.output_text || "";
 
-    // Save memory
-    const newHistory = trimHistory([...history, { role: "user", content: userText }, { role: "assistant", content: reply }]);
-    sessions.set(session_id, { messages: newHistory, ts: Date.now() });
+    // Update session memory (append assistant reply)
+    const newHistory = trimmed.concat([{ role: "assistant", content: reply }]);
+    if (sessionId) upsertSession(sessionId, newHistory.slice(-MAX_TURNS));
 
-    return res.json({ reply, safety_level: "low", mode });
+    const response = {
+      ok: true,
+      sessionId: sessionId || null,
+      reply,
+      used_model: OPENAI_MODEL,
+    };
+
+    setCache(cacheKey, response);
+    return res.json(response);
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 });
 
-// ======================================================
-//  /api/triage (structured triage like before)
-// ======================================================
+// --------- Optional: keep your old triage endpoint (if you still use it) ----------
 app.post("/api/triage", rateLimit, async (req, res) => {
   try {
     const { text, lang = "ar" } = req.body || {};
+    const L = normalizeLang(lang);
+
     if (!text || String(text).trim().length < 5) {
       return res.status(400).json({ error: "Text too short" });
     }
@@ -200,26 +238,20 @@ app.post("/api/triage", rateLimit, async (req, res) => {
         safety_level: "high",
         domain: "unclear",
         confidence: 0,
-        summary: lang === "ar" ? "الكلام فيه مؤشرات خطر واحتياج لدعم فوري." : "Risk indicators; urgent support needed.",
+        summary: L === "ar" ? "الكلام فيه مؤشرات خطر واحتياج لدعم فوري." : "Risk indicators; urgent support needed.",
         advice: [
-          lang === "ar"
+          L === "ar"
             ? "لو في خطر فوري: اطلب طوارئ/روح أقرب مستشفى، وكلم شخص موثوق حالًا."
-            : "If in immediate danger: contact emergency services / go to the nearest hospital, and call someone you trust now."
+            : "If in immediate danger: contact local emergency services / go to the nearest hospital, and call someone you trust now.",
         ],
         followups: [],
-        suggested_test: "FULL"
+        suggested_test: "FULL",
       });
-    }
-
-    const ck = cacheKey(String(text), String(lang || "ar"));
-    const c = cache.get(ck);
-    if (c && (Date.now() - c.ts) < CACHE_TTL_MS) {
-      return res.json({ ...c.data, cached: true });
     }
 
     const system_ar = `أنت "مُعِين" — مساعد داخل تطبيق تقييم ذاتي للصحة النفسية (تعليمي)، وليس تشخيصًا طبيًا.
 أسلوبك: مصري بسيط، هادي، محترم. لمسة دينية خفيفة بدون وعظ أو فتاوى.
-STRICT SAFETY: لا تشخيص نهائي، لا طلب بيانات حساسة. إن ظهرت مخاطر ارفع safety_level وأعطِ إرشاد طوارئ.
+STRICT SAFETY: لا تشخيص نهائي، لا طلب بيانات حساسة. إن ظهرت مخاطر (إيذاء نفس/انتحار) ارفع safety_level وأعطِ إرشاد طوارئ.
 أخرج JSON فقط وفق العقد:
 {
  "safety_level":"low|medium|high",
@@ -245,9 +277,9 @@ Return ONLY JSON:
 }`;
 
     const payload = {
-      model: "gpt-5.2",
+      model: OPENAI_MODEL,
       input: [
-        { role: "system", content: (lang === "ar" ? system_ar : system_en) },
+        { role: "system", content: (L === "ar" ? system_ar : system_en) },
         { role: "user", content: String(text) }
       ],
       text: { format: { type: "json_object" } }
@@ -256,10 +288,10 @@ Return ONLY JSON:
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
     if (!r.ok) {
@@ -274,10 +306,9 @@ Return ONLY JSON:
     try { parsed = JSON.parse(out); }
     catch { parsed = { error: "Bad JSON", raw: out }; }
 
-    cache.set(ck, { ts: Date.now(), data: parsed });
     return res.json(parsed);
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 });
 
