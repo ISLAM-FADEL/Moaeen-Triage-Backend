@@ -4030,26 +4030,31 @@ renderDoctorDirectory(report){
       </div>
 
       <div class="docActions">
+        <button class="btn" type="button" data-doc='${encodeURIComponent(JSON.stringify(d))}'>${isAr ? "📅 احجز / عن بُعد" : "📅 Book / Remote"}</button>
         <a class="btn primary" target="_blank" rel="noopener" href="${waLink}">${isAr ? 'واتساب' : 'WhatsApp'}</a>
         <a class="btn secondary" href="${emailLink}">${isAr ? 'إيميل' : 'Email'}</a>
       </div>
     `;
     list.appendChild(card);
   });
-
-    // Bind booking buttons
-    list.querySelectorAll('[data-book]').forEach(btn=>{
-      btn.onclick = ()=>{
-        try{
-          const raw = decodeURIComponent(btn.getAttribute('data-book'));
-          const doc = JSON.parse(raw);
-          this.openBookingModal(doc);
-        }catch(e){
-          console.warn(e);
-          this.openBookingModal(null);
-        }
-      };
-    });
+// Booking click delegation (robust)
+if(!list.dataset.bookDelegation){
+  list.dataset.bookDelegation = '1';
+  list.addEventListener('click', (e)=>{
+    const btn = e.target.closest('[data-doc]');
+    if(!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try{
+      const raw = decodeURIComponent(btn.getAttribute('data-doc') || '');
+      const doc = JSON.parse(raw);
+      this.openBookingModal(doc);
+    }catch(err){
+      console.warn(err);
+      this.openBookingModal(null);
+    }
+  }, true);
+}
 }
 
 // =======================
